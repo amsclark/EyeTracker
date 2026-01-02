@@ -1,4 +1,4 @@
-pyth# HEAD TRACKING MOUSE CONTROL
+# HEAD TRACKING MOUSE CONTROL
 
 This script uses your webcam and MediaPipe's Face Landmarker to estimate your head pose and control the mouse cursor using head orientation.
 
