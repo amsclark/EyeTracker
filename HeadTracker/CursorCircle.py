@@ -1,4 +1,10 @@
 import sys
+import os
+
+# Fix Qt plugin conflict between OpenCV and PyQt5
+if 'QT_QPA_PLATFORM_PLUGIN_PATH' in os.environ:
+    del os.environ['QT_QPA_PLATFORM_PLUGIN_PATH']
+
 import cv2
 import numpy as np
 import pyautogui

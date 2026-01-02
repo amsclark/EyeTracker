@@ -7,7 +7,6 @@ import math
 import threading
 import time
 import subprocess
-import keyboard
 
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
 CENTER_X = MONITOR_WIDTH // 2
@@ -36,16 +35,23 @@ calibration_offset_pitch = 0
 ray_origins = deque(maxlen=filter_length)
 ray_directions = deque(maxlen=filter_length)
 
-# Initialize MediaPipe Face Mesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False,
-                                  max_num_faces=1,
-                                  refine_landmarks=True,
-                                  min_detection_confidence=0.5,
-                                  min_tracking_confidence=0.5)
+# Initialize MediaPipe Face Landmarker (new API)
+base_options = mp.tasks.BaseOptions(model_asset_path='face_landmarker.task')
+options = mp.tasks.vision.FaceLandmarkerOptions(
+    base_options=base_options,
+    output_face_blendshapes=False,
+    output_facial_transformation_matrixes=False,
+    num_faces=1,
+    min_face_detection_confidence=0.5,
+    min_face_presence_confidence=0.5,
+    min_tracking_confidence=0.5,
+    running_mode=mp.tasks.vision.RunningMode.VIDEO
+)
+face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
 # Open camera
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)  # Try camera 0 first (default)
+frame_counter = 0
 
 # Landmark indices for bounding box
 LANDMARKS = {
@@ -76,10 +82,16 @@ while cap.isOpened():
 
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
+    
+    # Convert to MediaPipe Image
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    
+    # Process the frame with timestamp
+    results = face_landmarker.detect_for_video(mp_image, frame_counter)
+    frame_counter += 1
 
-    if results.multi_face_landmarks:
-        face_landmarks = results.multi_face_landmarks[0].landmark
+    if results.face_landmarks:
+        face_landmarks = results.face_landmarks[0]
         landmarks_frame = np.zeros_like(frame)  # Blank black frame
 
         outline_pts = []
@@ -257,12 +269,6 @@ while cap.isOpened():
     cv2.imshow("Head-Aligned Cube", frame)
     cv2.imshow("Facial Landmarks", landmarks_frame)
 
-    if keyboard.is_pressed('f7'):
-        mouse_control_enabled = not mouse_control_enabled
-        print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
-        time.sleep(0.3)  # debounce to prevent rapid toggling
-
-
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
@@ -270,6 +276,9 @@ while cap.isOpened():
         calibration_offset_yaw = 180 - raw_yaw_deg
         calibration_offset_pitch = 180 - raw_pitch_deg
         print(f"[Calibrated] Offset Yaw: {calibration_offset_yaw}, Offset Pitch: {calibration_offset_pitch}")
+    elif key == ord('t'):  # Toggle mouse control with 't' key
+        mouse_control_enabled = not mouse_control_enabled
+        print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
 
 
 cap.release()
