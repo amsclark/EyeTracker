@@ -14,6 +14,22 @@ CENTER_Y = MONITOR_HEIGHT // 2
 mouse_control_enabled = True
 filter_length = 8
 
+# Joystick/velocity mode parameters
+USE_VELOCITY_MODE = True  # Set to False for old position mode
+MAX_VELOCITY = 9  # Maximum cursor speed in pixels per frame
+DEAD_ZONE = 7  # Degrees - no movement within this range from center
+VELOCITY_SCALE = 0.7  # Sensitivity multiplier
+
+# Click detection parameters
+ENABLE_MOUTH_CLICK = True  # Click when mouth opens
+MOUTH_OPEN_THRESHOLD = 0.03  # Ratio of mouth opening to face height
+CLICK_COOLDOWN = 1  # Seconds between clicks
+last_click_time = 0
+
+# Stabilization parameters (for velocity mode)
+MOTION_THRESHOLD = 5  # pixels - ignore small movements
+SMOOTHING_ALPHA = 0.15  # weight for exponential smoothing (lower = smoother)
+
 
 FACE_OUTLINE_INDICES = [
     10, 338, 297, 332, 284, 251, 389, 356,
@@ -31,9 +47,26 @@ mouse_lock = threading.Lock()
 calibration_offset_yaw = 0
 calibration_offset_pitch = 0
 
+# Current cursor position for velocity mode
+current_cursor_x = CENTER_X
+current_cursor_y = CENTER_Y
+
 # Buffers to store recent ray data
 ray_origins = deque(maxlen=filter_length)
 ray_directions = deque(maxlen=filter_length)
+
+# Initialize Kalman filter for cursor position
+kalman = cv2.KalmanFilter(4, 2)
+kalman.measurementMatrix = np.array([[1, 0, 0, 0],
+                                      [0, 1, 0, 0]], np.float32)
+kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+                                    [0, 1, 0, 1],
+                                    [0, 0, 1, 0],
+                                    [0, 0, 0, 1]], np.float32)
+kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+
+# Previous cursor position for stabilization
+previous_cursor_position = (CENTER_X, CENTER_Y)
 
 # Initialize MediaPipe Face Landmarker (new API)
 base_options = mp.tasks.BaseOptions(model_asset_path='face_landmarker.task')
@@ -62,6 +95,10 @@ LANDMARKS = {
     "front": 1,
 }
 
+# Mouth landmarks for click detection
+MOUTH_TOP = 13      # Upper lip
+MOUTH_BOTTOM = 14   # Lower lip
+
 def mouse_mover():
     while True:
         if mouse_control_enabled == True:
@@ -72,6 +109,35 @@ def mouse_mover():
 
 def landmark_to_np(landmark, w, h):
     return np.array([landmark.x * w, landmark.y * h, landmark.z * w])
+
+def apply_threshold(current_pos, prev_pos, threshold=MOTION_THRESHOLD):
+    """Ignores small movements below a certain threshold."""
+    dist = np.linalg.norm(np.array(current_pos) - np.array(prev_pos))
+    if dist < threshold:
+        return prev_pos
+    return current_pos
+
+def smooth_position(current_pos, prev_pos, alpha=SMOOTHING_ALPHA):
+    """Applies exponential smoothing to reduce jitter."""
+    return tuple((1 - alpha) * np.array(prev_pos) + alpha * np.array(current_pos))
+
+def calculate_velocity(yaw_deviation, pitch_deviation):
+    """Calculate cursor velocity based on head deviation from center (joystick mode)."""
+    # Apply dead zone
+    if abs(yaw_deviation) < DEAD_ZONE:
+        yaw_deviation = 0
+    if abs(pitch_deviation) < DEAD_ZONE:
+        pitch_deviation = 0
+    
+    # Calculate velocity with scaling
+    velocity_x = (yaw_deviation / 20.0) * MAX_VELOCITY * VELOCITY_SCALE
+    velocity_y = (pitch_deviation / 10.0) * MAX_VELOCITY * VELOCITY_SCALE
+    
+    # Clamp to max velocity
+    velocity_x = np.clip(velocity_x, -MAX_VELOCITY, MAX_VELOCITY)
+    velocity_y = np.clip(velocity_y, -MAX_VELOCITY, MAX_VELOCITY)
+    
+    return velocity_x, velocity_y
 
 threading.Thread(target=mouse_mover, daemon=True).start()
 
@@ -103,6 +169,30 @@ while cap.isOpened():
                 color = (155, 155, 155) if i in FACE_OUTLINE_INDICES else (255, 25, 10)
                 cv2.circle(landmarks_frame, (x, y), 3, color, -1)
                 frame[y, x] = (255, 255, 255)  # optional: also update main frame if needed
+
+        # Mouth click detection
+        if ENABLE_MOUTH_CLICK:
+            mouth_top = landmark_to_np(face_landmarks[MOUTH_TOP], w, h)
+            mouth_bottom = landmark_to_np(face_landmarks[MOUTH_BOTTOM], w, h)
+            mouth_distance = np.linalg.norm(mouth_top - mouth_bottom)
+            
+            # Get face height for normalization
+            top_pt = landmark_to_np(face_landmarks[LANDMARKS["top"]], w, h)
+            bottom_pt = landmark_to_np(face_landmarks[LANDMARKS["bottom"]], w, h)
+            face_height = np.linalg.norm(top_pt - bottom_pt)
+            
+            mouth_ratio = mouth_distance / face_height if face_height > 0 else 0
+            
+            # Check if mouth is open and cooldown has passed
+            current_time = time.time()
+            if mouth_ratio > MOUTH_OPEN_THRESHOLD and (current_time - last_click_time) > CLICK_COOLDOWN:
+                pyautogui.click()
+                last_click_time = current_time
+                print(f"CLICK! (mouth ratio: {mouth_ratio:.3f})")
+            
+            # Display mouth status
+            cv2.putText(frame, f"Mouth: {mouth_ratio:.3f}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if mouth_ratio > MOUTH_OPEN_THRESHOLD else (255, 255, 255), 2)
 
         
 
@@ -237,21 +327,57 @@ while cap.isOpened():
         yaw_deg += calibration_offset_yaw
         pitch_deg += calibration_offset_pitch
 
-        # Map to full screen resolution
-        screen_x = int(((yaw_deg - (180 - yawDegrees)) / (2 * yawDegrees)) * MONITOR_WIDTH)
-        screen_y = int(((180 + pitchDegrees - pitch_deg) / (2 * pitchDegrees)) * MONITOR_HEIGHT)
+        if USE_VELOCITY_MODE:
+            # Velocity/joystick mode: head deviation controls cursor speed
+            yaw_deviation = yaw_deg - 180  # Deviation from center
+            pitch_deviation = pitch_deg - 180
+            
+            # Calculate velocity
+            velocity_x, velocity_y = calculate_velocity(yaw_deviation, pitch_deviation)
+            
+            # Update cursor position incrementally
+            current_cursor_x += velocity_x
+            current_cursor_y -= velocity_y  # Invert Y (up = negative pitch deviation)
+            
+            # Clamp to screen bounds
+            current_cursor_x = np.clip(current_cursor_x, 10, MONITOR_WIDTH - 10)
+            current_cursor_y = np.clip(current_cursor_y, 10, MONITOR_HEIGHT - 10)
+            
+            screen_x, screen_y = int(current_cursor_x), int(current_cursor_y)
+            
+            print(f"Velocity mode - Deviation: yaw={yaw_deviation:.1f}° pitch={pitch_deviation:.1f}° | "
+                  f"Velocity: x={velocity_x:.1f} y={velocity_y:.1f} | Position: ({screen_x}, {screen_y})")
+        else:
+            # Original position mode: head angle maps directly to screen position
+            # Map to full screen resolution
+            screen_x = int(((yaw_deg - (180 - yawDegrees)) / (2 * yawDegrees)) * MONITOR_WIDTH)
+            screen_y = int(((180 + pitchDegrees - pitch_deg) / (2 * pitchDegrees)) * MONITOR_HEIGHT)
 
-        # Clamp screen position to monitor bounds
-        if(screen_x < 10):
-            screen_x = 10
-        if(screen_y < 10):
-            screen_y = 10
-        if(screen_x > MONITOR_WIDTH - 10):
-            screen_x = MONITOR_WIDTH - 10
-        if(screen_y > MONITOR_HEIGHT - 10):
-            screen_y = MONITOR_HEIGHT - 10
+            # Clamp screen position to monitor bounds
+            if(screen_x < 10):
+                screen_x = 10
+            if(screen_y < 10):
+                screen_y = 10
+            if(screen_x > MONITOR_WIDTH - 10):
+                screen_x = MONITOR_WIDTH - 10
+            if(screen_y > MONITOR_HEIGHT - 10):
+                screen_y = MONITOR_HEIGHT - 10
 
-        print(f"Screen position: x={screen_x}, y={screen_y}")
+            # Apply Kalman filter
+            measurement = np.array([[np.float32(screen_x)], [np.float32(screen_y)]])
+            kalman.correct(measurement)
+            predicted = kalman.predict()
+            smoothed_x, smoothed_y = int(predicted[0]), int(predicted[1])
+            
+            # Apply additional stabilization
+            stabilized_position = apply_threshold((smoothed_x, smoothed_y), previous_cursor_position)
+            stabilized_position = smooth_position(stabilized_position, previous_cursor_position)
+            
+            # Update previous position
+            previous_cursor_position = stabilized_position
+            screen_x, screen_y = stabilized_position
+
+            print(f"Screen position: x={screen_x}, y={screen_y}")
 
         if mouse_control_enabled:
             with mouse_lock:
